@@ -1,51 +1,43 @@
-// TokyoTosho provider for Hayase
+// TokyoTosho provider for Hayase — via AnimeTosho JSON API
 //
-// CORS PROBLEM & SOLUTION
-// ───────────────────────
-// tokyotosho.info does NOT send CORS headers, so direct browser fetches are
-// blocked on hayase.app (and any other web origin).  Public CORS proxies like
-// corsproxy.io and allorigins also block hayase.app.
+// Why AnimeTosho and not tokyotosho.info directly:
+//   TT has no CORS headers → blocked from hayase.app.
+//   Public proxies (corsproxy.io, allorigins) also block hayase.app.
+//   AnimeTosho mirrors TT in real time and has Access-Control-Allow-Origin: *.
 //
-// The fix: use the AnimeTosho (AT) feed API, which:
-//   • Has proper CORS headers (Access-Control-Allow-Origin: *)
-//   • Mirrors the full TokyoTosho catalogue in real time
-//   • Exposes source=2 to filter for TokyoTosho-only entries
-//   • Returns richer metadata (seeders, size, infohash) than TT's own RSS
+// Why JSON and not the Torznab/RSS endpoint:
+//   The RSS/XML endpoint is slow and we were firing it once per title variant,
+//   causing a 10-second timeout. The JSON endpoint is much faster and supports
+//   multiple search terms in one request.
 //
-// API docs: https://animetosho.org/api
-// Feed API: https://feed.animetosho.org/api  (CORS-safe)
-//
-// Torznab category IDs used:
-//   cat=5070  →  Anime  (covers TT filter=1 Anime + filter=7 Raws)
-//   cat=6070  →  XXX    (covers TT filter=4,12 Hentai)
+// API: https://feed.animetosho.org/json?q=<query>
+// Docs: https://animetosho.org/api  (scroll to "JSON API")
 
-const AT_API = "https://feed.animetosho.org/api";
+const AT_JSON = "https://feed.animetosho.org/json";
 
-const sizeMap = {
-  B: 1, KB: 1000, MB: 1e6, GB: 1e9, TB: 1e12,
-  KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3, TiB: 1024 ** 4
-};
+// AnimeTosho source IDs  (used to filter to TT-only results)
+//   1 = Nyaa    2 = TokyoTosho    3 = AniDex (removed)
+const TT_SOURCE_ID = 2;
 
 export default new class {
-  // Original TT URL — kept for reference only; fetches go via AnimeTosho
+  // Original TT URL kept for display; all fetches go through AnimeTosho
   url = atob("aHR0cHM6Ly93d3cudG9reW90b3Noby5pbmZvLw==");
 
-  _cat(media) {
-    return (media.isAdult || media.genres?.includes("Hentai")) ? 6070 : 5070;
-  }
-
-  async _search(query, cat) {
-    if (!navigator.onLine) return [];
-    const url =
-      `${AT_API}?t=search` +
-      `&q=${encodeURIComponent(query)}` +
-      `&source=2` +        // TokyoTosho only
-      `&cat=${cat}` +
-      `&extended=1` +
-      `&limit=100`;
+  /**
+   * Single JSON fetch for one query string.
+   * Returns raw AT JSON array filtered to TT source entries.
+   */
+  async _fetch(query) {
+    const url = `${AT_JSON}?q=${encodeURIComponent(query)}&order=seeders&limit=100`;
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`AnimeTosho API error: ${res.statusText}`);
-    return parseATItems(await res.text());
+    if (!res.ok) throw new Error(`AnimeTosho JSON API error ${res.status}: ${res.statusText}`);
+    const json = await res.json();
+    if (!Array.isArray(json)) return [];
+    // Filter to TokyoTosho-source entries only
+    return json.filter(item =>
+      Array.isArray(item.trackers) &&
+      item.trackers.some(t => t.source_id === TT_SOURCE_ID)
+    );
   }
 
   async single(
@@ -56,13 +48,13 @@ export default new class {
     if (!navigator.onLine) return [];
 
     const titles     = createTitle([...Object.values(media.title), ...media.synonyms]);
-    const cat        = this._cat(media);
     const prequel    = findEdge(media, "PREQUEL")?.node;
     const sequel     = findEdge(media, "SEQUEL")?.node;
     const absoluteep = absoluteEpisodeNumber ?? episode;
     const episodes   = [episode];
     if (absoluteep !== episode && absoluteep > episodeCount) episodes.push(absoluteep);
 
+    // Episode / batch suffix
     let epPart = "";
     if (episodeCount > 1) {
       if (isBatch) {
@@ -78,22 +70,26 @@ export default new class {
       }
     }
 
+    // Build one query per title variant, then fire ALL in parallel (Promise.all).
+    // This avoids the sequential-waterfall timeout that killed the previous version.
+    const queries = titles.map(t => buildQuery(t, epPart));
+    const results = await Promise.allSettled(queries.map(q => this._fetch(q)));
+
+    // Merge, deduplicate by infohash
     const seen    = new Set();
     let   entries = [];
-
-    for (const title of titles) {
-      const q = buildQuery(title, epPart, exclusions);
-      try {
-        for (const entry of await this._search(q, cat)) {
-          if (!seen.has(entry.hash)) {
-            seen.add(entry.hash);
-            entries.push(entry);
-          }
+    for (const r of results) {
+      if (r.status !== "fulfilled") continue;
+      for (const item of r.value) {
+        const hash = item.info_hash?.toLowerCase() || item.id?.toString() || "?";
+        if (!seen.has(hash)) {
+          seen.add(hash);
+          entries.push(toEntry(item, hash));
         }
-      } catch { /* one title failing shouldn't abort everything */ }
+      }
     }
 
-    // Date-based prequel/sequel filtering — identical to Nyaa provider
+    // Date-based prequel/sequel filtering — same logic as Nyaa provider
     const checkSequelDate =
       media.status === "FINISHED" &&
       (sequel?.status === "FINISHED" || sequel?.status === "RELEASING") &&
@@ -121,11 +117,10 @@ export default new class {
 
   async test() {
     try {
-      const res = await fetch(`${AT_API}?t=search&q=test&source=2&limit=1`);
+      const res = await fetch(`${AT_JSON}?q=test&limit=1`);
       if (!res.ok) throw new Error(res.statusText);
-      const xml = await res.text();
-      if (!xml.includes("<rss") && !xml.includes("<channel"))
-        throw new Error("Unexpected response from AnimeTosho API");
+      const json = await res.json();
+      if (!Array.isArray(json)) throw new Error("Unexpected response from AnimeTosho JSON API");
       return true;
     } catch (e) {
       throw new Error(`Could not reach AnimeTosho (TokyoTosho mirror)!\n${e.message}`);
@@ -133,7 +128,35 @@ export default new class {
   }
 };
 
-// ─── helpers ────────────────────────────────────────────────────────────────
+// ─── shape an AT JSON item into a Hayase torrent entry ───────────────────────
+
+function toEntry(item, hash) {
+  // Prefer magnet URI; fall back to direct .torrent link
+  const link = item.magnet_uri || item.torrent_url || item.link || "?";
+
+  // Seeder/leecher data lives inside item.trackers[]
+  let seeders = 0, leechers = 0;
+  if (Array.isArray(item.trackers)) {
+    for (const t of item.trackers) {
+      seeders  = Math.max(seeders,  t.seeders  ?? 0);
+      leechers = Math.max(leechers, t.leechers ?? 0);
+    }
+  }
+
+  return {
+    title:     item.title || "?",
+    link,
+    seeders,
+    leechers,
+    downloads: item.num_files ?? 0,
+    size:      item.total_size ?? 0,
+    hash,
+    accuracy:  "low",
+    date:      new Date((item.timestamp ?? 0) * 1000)
+  };
+}
+
+// ─── helpers (identical logic to Nyaa provider) ──────────────────────────────
 
 function zeropad(v = 1, l = 2) {
   return (typeof v === "string" ? v : v.toString()).padStart(l, "0");
@@ -145,6 +168,7 @@ const epstring = ep =>
 function buildQuery(title, epPart) {
   let q = title.replace(/%26/g, "&").replace(/%3F/g, "?").replace(/%23/g, "#");
   if (epPart) {
+    // Pull the simplest ep token, e.g. "E01" from the OR-string
     const firstEp = epPart.match(/"([^"]+)"/)?.[1]?.replace(/[+v-]/g, "").trim();
     if (firstEp) q += ` ${firstEp}`;
   }
@@ -159,7 +183,7 @@ function createTitle(_titles) {
     titles.push(title);
     const m2 = title.match(/Season (\d)/i);
     const m1 = title.match(/(\d)(?:nd|rd|th) Season/i);
-    if (m2)      titles.push(title.replace(/Season \d/i,             `S${m2[1]}`));
+    if (m2)      titles.push(title.replace(/Season \d/i,              `S${m2[1]}`));
     else if (m1) titles.push(title.replace(/(\d)(?:nd|rd|th) Season/i, `S${m1[1]}`));
   };
   for (const t of grouped) {
@@ -176,71 +200,4 @@ function findEdge(media, type, formats = ["TV", "TV_SHORT"], skip) {
   if (!res && !skip && type === "SEQUEL")
     res = findEdge(media, type, ["TV", "TV_SHORT", "OVA"], true);
   return res;
-}
-
-/**
- * Parse AnimeTosho Torznab RSS XML.
- *
- * Key tags per <item>:
- *   <title>…</title>
- *   <enclosure url="…torrent" length="…" type="application/x-bittorrent"/>
- *   <pubDate>…</pubDate>
- *   <torznab:attr name="seeders"  value="N"/>
- *   <torznab:attr name="leechers" value="N"/>
- *   <torznab:attr name="grabs"    value="N"/>
- *   <torznab:attr name="infohash" value="…"/>  ← always present
- *   <torznab:attr name="size"     value="N"/>  ← bytes
- */
-function parseATItems(xml) {
-  if (!xml) return [];
-  const items     = [];
-  const itemRegex = /<item>([\s\S]*?)<\/item>/g;
-  let match;
-
-  while ((match = itemRegex.exec(xml)) !== null) {
-    const c = match[1];
-
-    const title =
-      /<title><!\[CDATA\[(.+?)\]\]><\/title>/i.exec(c)?.[1] ||
-      /<title>(.+?)<\/title>/i.exec(c)?.[1] || "?";
-
-    const enclosureUrl = /enclosure[^>]+url="([^"]+)"/i.exec(c)?.[1];
-    const pageLink     = /<link>([^<]+)<\/link>/i.exec(c)?.[1]?.trim() || "?";
-    const link         = enclosureUrl || pageLink;
-
-    const pubDate = /<pubDate>(.+?)<\/pubDate>/i.exec(c)?.[1] ?? 0;
-
-    const attr = name => {
-      const re = new RegExp(
-        `(?:torznab|newznab):attr[^>]+name="${name}"[^>]+value="([^"]*)"`, "i"
-      );
-      return re.exec(c)?.[1] ?? null;
-    };
-
-    const seeders     = Number(attr("seeders")  ?? 0);
-    const leechers    = Number(attr("leechers") ?? 0);
-    const downloads   = Number(attr("grabs")    ?? 0);
-    const sizeInBytes = parseInt(attr("size") ?? /enclosure[^>]+length="(\d+)"/i.exec(c)?.[1] ?? "0", 10);
-    const hash        = attr("infohash") || /([0-9a-fA-F]{40})/.exec(link)?.[1] || "?";
-
-    items.push({
-      title: decodeEntities(title),
-      link,
-      seeders,
-      leechers,
-      downloads,
-      size: sizeInBytes,
-      hash,
-      accuracy: "low",
-      date: new Date(pubDate)
-    });
-  }
-  return items;
-}
-
-function decodeEntities(str) {
-  return str
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#34;/g, '"')
-    .replace(/&#39;/g, "'").replace(/&apos;/g, "'");
 }
