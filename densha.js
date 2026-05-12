@@ -1,42 +1,28 @@
 // TokyoTosho provider for Hayase — via AnimeTosho JSON API
 //
-// Why AnimeTosho and not tokyotosho.info directly:
-//   TT has no CORS headers → blocked from hayase.app.
-//   Public proxies (corsproxy.io, allorigins) also block hayase.app.
-//   AnimeTosho mirrors TT in real time and has Access-Control-Allow-Origin: *.
-//
-// Why JSON and not the Torznab/RSS endpoint:
-//   The RSS/XML endpoint is slow and we were firing it once per title variant,
-//   causing a 10-second timeout. The JSON endpoint is much faster and supports
-//   multiple search terms in one request.
-//
-// API: https://feed.animetosho.org/json?q=<query>
-// Docs: https://animetosho.org/api  (scroll to "JSON API")
+// CORS: tokyotosho.info blocks browser fetches; AnimeTosho mirrors TT in
+//       real time and sends Access-Control-Allow-Origin: *.
+// API:  https://feed.animetosho.org/json?q=<query>&limit=100
+// Docs: https://animetosho.org/api
 
-const AT_JSON = "https://feed.animetosho.org/json";
-
-// AnimeTosho source IDs  (used to filter to TT-only results)
-//   1 = Nyaa    2 = TokyoTosho    3 = AniDex (removed)
-const TT_SOURCE_ID = 2;
+const AT_JSON     = "https://feed.animetosho.org/json";
+const TT_SOURCE   = 2;   // AnimeTosho source_id for TokyoTosho
+const REQ_DELAY   = 600; // ms between sequential requests (avoids 429)
+const MAX_TITLES  = 3;   // only use the best N title variants per search
 
 export default new class {
-  // Original TT URL kept for display; all fetches go through AnimeTosho
   url = atob("aHR0cHM6Ly93d3cudG9reW90b3Noby5pbmZvLw==");
 
-  /**
-   * Single JSON fetch for one query string.
-   * Returns raw AT JSON array filtered to TT source entries.
-   */
   async _fetch(query) {
     const url = `${AT_JSON}?q=${encodeURIComponent(query)}&order=seeders&limit=100`;
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`AnimeTosho JSON API error ${res.status}: ${res.statusText}`);
+    if (res.status === 429) throw new Error("Rate limited by AnimeTosho — try again in a moment");
+    if (!res.ok) throw new Error(`AnimeTosho error ${res.status}`);
     const json = await res.json();
     if (!Array.isArray(json)) return [];
-    // Filter to TokyoTosho-source entries only
     return json.filter(item =>
       Array.isArray(item.trackers) &&
-      item.trackers.some(t => t.source_id === TT_SOURCE_ID)
+      item.trackers.some(t => t.source_id === TT_SOURCE)
     );
   }
 
@@ -47,14 +33,14 @@ export default new class {
   ) {
     if (!navigator.onLine) return [];
 
-    const titles     = createTitle([...Object.values(media.title), ...media.synonyms]);
+    // Pick only the best title variants to minimise request count
+    const titles     = pickTitles(media);
     const prequel    = findEdge(media, "PREQUEL")?.node;
     const sequel     = findEdge(media, "SEQUEL")?.node;
     const absoluteep = absoluteEpisodeNumber ?? episode;
     const episodes   = [episode];
     if (absoluteep !== episode && absoluteep > episodeCount) episodes.push(absoluteep);
 
-    // Episode / batch suffix
     let epPart = "";
     if (episodeCount > 1) {
       if (isBatch) {
@@ -70,26 +56,31 @@ export default new class {
       }
     }
 
-    // Build one query per title variant, then fire ALL in parallel (Promise.all).
-    // This avoids the sequential-waterfall timeout that killed the previous version.
-    const queries = titles.map(t => buildQuery(t, epPart));
-    const results = await Promise.allSettled(queries.map(q => this._fetch(q)));
-
-    // Merge, deduplicate by infohash
+    // Fire requests sequentially with a small delay between each.
+    // Parallel blasting caused 429s; sequential + delay stays under the limit.
     const seen    = new Set();
     let   entries = [];
-    for (const r of results) {
-      if (r.status !== "fulfilled") continue;
-      for (const item of r.value) {
-        const hash = item.info_hash?.toLowerCase() || item.id?.toString() || "?";
-        if (!seen.has(hash)) {
-          seen.add(hash);
-          entries.push(toEntry(item, hash));
+
+    for (let i = 0; i < titles.length; i++) {
+      if (i > 0) await sleep(REQ_DELAY);
+      try {
+        const results = await this._fetch(buildQuery(titles[i], epPart));
+        for (const item of results) {
+          const hash = item.info_hash?.toLowerCase() || String(item.id);
+          if (!seen.has(hash)) {
+            seen.add(hash);
+            entries.push(toEntry(item, hash));
+          }
         }
+        // Stop early if we already have plenty of results
+        if (entries.length >= 50) break;
+      } catch (e) {
+        if (e.message.includes("Rate limited")) throw e; // surface 429 immediately
+        // other errors: skip this title variant and continue
       }
     }
 
-    // Date-based prequel/sequel filtering — same logic as Nyaa provider
+    // Date-based prequel/sequel filtering
     const checkSequelDate =
       media.status === "FINISHED" &&
       (sequel?.status === "FINISHED" || sequel?.status === "RELEASING") &&
@@ -119,8 +110,7 @@ export default new class {
     try {
       const res = await fetch(`${AT_JSON}?q=test&limit=1`);
       if (!res.ok) throw new Error(res.statusText);
-      const json = await res.json();
-      if (!Array.isArray(json)) throw new Error("Unexpected response from AnimeTosho JSON API");
+      if (!Array.isArray(await res.json())) throw new Error("Unexpected response");
       return true;
     } catch (e) {
       throw new Error(`Could not reach AnimeTosho (TokyoTosho mirror)!\n${e.message}`);
@@ -128,21 +118,57 @@ export default new class {
   }
 };
 
-// ─── shape an AT JSON item into a Hayase torrent entry ───────────────────────
+// ─── title selection ─────────────────────────────────────────────────────────
+// Instead of generating every possible variant, pick at most MAX_TITLES
+// candidates in priority order:
+//   1. romaji title  (usually what TT uploaders use)
+//   2. english title (if meaningfully different)
+//   3. shortest synonym > 3 chars (as a fallback)
 
-function toEntry(item, hash) {
-  // Prefer magnet URI; fall back to direct .torrent link
-  const link = item.magnet_uri || item.torrent_url || item.link || "?";
+function pickTitles(media) {
+  const { romaji, english, native } = media.title;
+  const candidates = [];
 
-  // Seeder/leecher data lives inside item.trackers[]
-  let seeders = 0, leechers = 0;
-  if (Array.isArray(item.trackers)) {
-    for (const t of item.trackers) {
-      seeders  = Math.max(seeders,  t.seeders  ?? 0);
-      leechers = Math.max(leechers, t.leechers ?? 0);
-    }
+  const push = t => {
+    if (!t || t.length <= 3) return;
+    // Normalise and de-duplicate
+    const norm = t.trim();
+    if (!candidates.some(c => c.toLowerCase() === norm.toLowerCase()))
+      candidates.push(norm);
+  };
+
+  push(romaji);
+  if (english && english !== romaji) push(english);
+
+  // Add season alias if present
+  for (const t of [romaji, english]) {
+    if (!t) continue;
+    const m2 = t.match(/Season (\d)/i);
+    const m1 = t.match(/(\d)(?:nd|rd|th) Season/i);
+    if (m2) push(t.replace(/Season \d/i, `S${m2[1]}`));
+    else if (m1) push(t.replace(/(\d)(?:nd|rd|th) Season/i, `S${m1[1]}`));
   }
 
+  // Fallback: shortest synonym
+  if (candidates.length === 0) {
+    const syn = [...(media.synonyms || [])]
+      .filter(s => s && s.length > 3)
+      .sort((a, b) => a.length - b.length)[0];
+    push(syn);
+  }
+
+  return candidates.slice(0, MAX_TITLES);
+}
+
+// ─── entry shaping ───────────────────────────────────────────────────────────
+
+function toEntry(item, hash) {
+  const link = item.magnet_uri || item.torrent_url || item.link || "?";
+  let seeders = 0, leechers = 0;
+  for (const t of (item.trackers || [])) {
+    seeders  = Math.max(seeders,  t.seeders  ?? 0);
+    leechers = Math.max(leechers, t.leechers ?? 0);
+  }
   return {
     title:     item.title || "?",
     link,
@@ -156,7 +182,9 @@ function toEntry(item, hash) {
   };
 }
 
-// ─── helpers (identical logic to Nyaa provider) ──────────────────────────────
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function zeropad(v = 1, l = 2) {
   return (typeof v === "string" ? v : v.toString()).padStart(l, "0");
@@ -166,31 +194,12 @@ const epstring = ep =>
   `"E${zeropad(ep)}+"|"E${zeropad(ep)}v"|"+${zeropad(ep)}+"|"+${zeropad(ep)}v"|"+${zeropad(ep)}-"`;
 
 function buildQuery(title, epPart) {
-  let q = title.replace(/%26/g, "&").replace(/%3F/g, "?").replace(/%23/g, "#");
+  let q = title.replace(/&/g, "").replace(/\?/g, "").replace(/#/g, "");
   if (epPart) {
-    // Pull the simplest ep token, e.g. "E01" from the OR-string
     const firstEp = epPart.match(/"([^"]+)"/)?.[1]?.replace(/[+v-]/g, "").trim();
     if (firstEp) q += ` ${firstEp}`;
   }
-  return q;
-}
-
-function createTitle(_titles) {
-  const grouped = [...new Set(_titles.filter(n => n != null && n.length > 3))];
-  const titles  = [];
-  const appendTitle = t => {
-    const title = t.replace(/&/g, "%26").replace(/\?/g, "%3F").replace(/#/g, "%23");
-    titles.push(title);
-    const m2 = title.match(/Season (\d)/i);
-    const m1 = title.match(/(\d)(?:nd|rd|th) Season/i);
-    if (m2)      titles.push(title.replace(/Season \d/i,              `S${m2[1]}`));
-    else if (m1) titles.push(title.replace(/(\d)(?:nd|rd|th) Season/i, `S${m1[1]}`));
-  };
-  for (const t of grouped) {
-    appendTitle(t);
-    if (t.includes("-")) appendTitle(t.replaceAll("-", ""));
-  }
-  return titles;
+  return q.trim();
 }
 
 function findEdge(media, type, formats = ["TV", "TV_SHORT"], skip) {
