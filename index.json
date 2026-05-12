@@ -3,7 +3,7 @@
     "manifestVersion": 2,
     "name": "tokyotosho",
     "id": "tokyotosho",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "type": "torrent",
     "accuracy": "low",
     "ratio": 0,
