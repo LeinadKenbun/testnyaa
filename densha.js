@@ -1,6 +1,10 @@
 // TokyoTosho provider — mirrors the structure of the Nyaa provider
 // Covers filter=1 (Anime) and filter=7 (Raws); hentai categories (4,12,13,14) for adult content
 // RSS URL: https://www.tokyotosho.info/rss.php?filter=<cats>&terms=<query>
+//
+// NOTE: TokyoTosho does NOT send CORS headers, so direct browser fetches are
+// blocked on hayase.app. All requests are routed through a CORS proxy.
+// Two public proxies are tried in order; the first to succeed wins.
 
 const sizeMap = {
   B:   1,
@@ -121,13 +125,15 @@ export default new class {
   movie = this.batch;
 
   async test() {
+    // Use getRSSContent so the same proxy chain is exercised during the health check.
     try {
-      const res = await fetch(`${this.url}rss.php?filter=1`);
-      if (!res.ok) throw new Error(`Failed to load data from ${this.url}! Is the site down?`);
+      const xml = await getRSSContent(`${this.url}rss.php?filter=1`);
+      if (!xml?.includes("<rss")) throw new Error("Unexpected response body");
       return true;
     } catch (error) {
       throw new Error(
-        `Could not reach ${this.url}! Does the site work in your region?`
+        `Could not reach ${this.url} via proxy! ` +
+        `Is the site down, or are the CORS proxies blocked in your region?\n${error.message}`
       );
     }
   }
@@ -291,13 +297,40 @@ function decodeHTMLEntities(str) {
     .replace(/&apos;/g, "'");
 }
 
+// ─── CORS proxy helpers ──────────────────────────────────────────────────────
+//
+// TokyoTosho blocks direct browser requests (no Access-Control-Allow-Origin).
+// We try two well-known public proxies in sequence and use the first that works.
+//
+//  1. corsproxy.io  — wraps the URL as a path prefix, returns raw content
+//  2. allorigins    — returns JSON { contents: "<raw xml>" }
+//
+// If both fail we throw so Hayase can show a meaningful error.
+
+const CORS_PROXIES = [
+  {
+    wrap:    url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+    extract: async res => res.text()
+  },
+  {
+    wrap:    url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    extract: async res => res.text()
+  }
+];
+
 async function getRSSContent(url) {
   if (!url) return null;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error("Failed fetching RSS!\n" + res.statusText);
-    return await res.text();
-  } catch (e) {
-    throw new Error("Failed fetching RSS!\n" + e.message);
+
+  let lastErr;
+  for (const proxy of CORS_PROXIES) {
+    try {
+      const res = await fetch(proxy.wrap(url));
+      if (!res.ok) throw new Error(res.statusText);
+      return await proxy.extract(res);
+    } catch (e) {
+      lastErr = e;
+    }
   }
+
+  throw new Error("Failed fetching TokyoTosho RSS (all proxies failed)!\n" + lastErr?.message);
 }
