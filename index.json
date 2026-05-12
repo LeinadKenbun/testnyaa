@@ -1,0 +1,19 @@
+[
+  {
+    "manifestVersion": 2,
+    "name": "Nyaa Sukebei",
+    "id": "sukebei-nyaa",
+    "version": "0.0.2",
+    "type": "torrent",
+    "accuracy": "low",
+    "ratio": 0,
+    "media": "sub",
+    "languages": [
+      "US"
+    ],
+    "icon": "https://sukebei.nyaa.si/static/favicon.png",
+    "update": "https://exten.pages.dev/hentai/index.json",
+    "code": "https://exten.pages.dev/hentai/sukebei.js",
+    "url": "aHR0cHM6Ly9ueWFhLnNpLw=="
+  }
+]
