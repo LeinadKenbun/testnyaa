@@ -1,23 +1,35 @@
-// TokyoTosho provider for Hayase — via AnimeTosho JSON API
+// TokyoTosho provider for Hayase
 //
-// tokyotosho.info has no CORS headers → blocked from hayase.app.
-// AnimeTosho mirrors TT in real time and sends Access-Control-Allow-Origin: *.
-// API: https://feed.animetosho.org/json?q=<query>&limit=100
+// Approach: parse TT's search page HTML (not RSS).
+// The HTML search page at /search.php includes direct torrent links,
+// seeders, leechers, size, and date — everything we need.
+// The page responds with: Access-Control-Allow-Origin: *
+// (Unlike the RSS endpoint which does not.)
+//
+// Search URL: https://www.tokyotosho.info/search.php?terms=<q>&type=<cat>
+// type=0 = All, type=1 = Anime, type=7 = Raws, type=4 = Hentai
 
-const AT_JSON    = "https://feed.animetosho.org/json";
-const REQ_DELAY  = 500; // ms between sequential requests to avoid 429
-const MAX_TITLES = 3;   // max title variants to try per search
+const TT = "https://www.tokyotosho.info";
 
 export default new class {
   url = atob("aHR0cHM6Ly93d3cudG9reW90b3Noby5pbmZvLw==");
 
-  async _fetch(query) {
-    const url = `${AT_JSON}?q=${encodeURIComponent(query)}&limit=100`;
+  _cat(media) {
+    if (media.isAdult || media.genres?.includes("Hentai")) return 4;
+    return 1; // Anime (TT also shows Raws under type=0 if needed)
+  }
+
+  async _fetch(query, type) {
+    const url =
+      `${TT}/search.php` +
+      `?terms=${encodeURIComponent(query)}` +
+      `&type=${type}` +
+      `&searchName=true` +
+      `&searchComment=false`;
     const res = await fetch(url);
-    if (res.status === 429) throw new Error("Rate limited by AnimeTosho — try again shortly");
-    if (!res.ok) throw new Error(`AnimeTosho error ${res.status}`);
-    const json = await res.json();
-    return Array.isArray(json) ? json : [];
+    if (res.status === 429) throw new Error("Rate limited by TokyoTosho — try again shortly");
+    if (!res.ok) throw new Error(`TokyoTosho error ${res.status}`);
+    return parseHTML(await res.text());
   }
 
   async single(
@@ -28,6 +40,7 @@ export default new class {
     if (!navigator.onLine) return [];
 
     const titles     = pickTitles(media);
+    const type       = this._cat(media);
     const prequel    = findEdge(media, "PREQUEL")?.node;
     const sequel     = findEdge(media, "SEQUEL")?.node;
     const absoluteep = absoluteEpisodeNumber ?? episode;
@@ -53,14 +66,13 @@ export default new class {
     let   entries = [];
 
     for (let i = 0; i < titles.length; i++) {
-      if (i > 0) await sleep(REQ_DELAY);
+      if (i > 0) await sleep(500);
       try {
-        const items = await this._fetch(buildQuery(titles[i], epPart));
-        for (const item of items) {
-          const hash = (item.info_hash || String(item.id)).toLowerCase();
-          if (!seen.has(hash)) {
-            seen.add(hash);
-            entries.push(toEntry(item, hash));
+        const q = buildQuery(titles[i], epPart);
+        for (const entry of await this._fetch(q, type)) {
+          if (!seen.has(entry.hash)) {
+            seen.add(entry.hash);
+            entries.push(entry);
           }
         }
         if (entries.length >= 50) break;
@@ -97,81 +109,84 @@ export default new class {
 
   async test() {
     try {
-      const res = await fetch(`${AT_JSON}?q=test&limit=1`);
+      const res = await fetch(`${TT}/search.php?terms=test&type=1`);
       if (!res.ok) throw new Error(res.statusText);
-      if (!Array.isArray(await res.json())) throw new Error("Unexpected response");
+      const html = await res.text();
+      if (!html.includes("tokyotosho")) throw new Error("Unexpected response");
       return true;
     } catch (e) {
-      throw new Error(`Could not reach AnimeTosho!\n${e.message}`);
+      throw new Error(`Could not reach TokyoTosho!\n${e.message}`);
     }
   }
 };
 
-// ─── map AT JSON item → Hayase entry ────────────────────────────────────────
-// AT JSON fields (top-level, all direct):
-//   title, info_hash, id, magnet_uri, torrent_url, link
-//   seeders, leechers, total_size, timestamp, num_files
+// ─── HTML parser ─────────────────────────────────────────────────────────────
+//
+// TT search result rows look like:
+//
+// <tr class="category_0">   (or category_1, category_7, etc.)
+//   <td>...</td>            (category icon)
+//   <td class="desc-top">
+//     <a href="https://…torrent">TITLE</a>   ← torrent link + title
+//     <a href="https://…">Website</a>
+//     <a href="/details.php?id=NNN">Details</a>
+//   </td>
+//   <td class="desc-bot">
+//     ... Size: X.XXmb ... S:NN L:NN C:NN ID:NNN
+//     Date: YYYY-MM-DD HH:MM UTC
+//   </td>
+// </tr>
 
-function toEntry(item, hash) {
-  return {
-    title:     item.title     || "?",
-    link:      item.magnet_uri || item.torrent_url || item.link || "?",
-    seeders:   item.seeders   ?? 0,
-    leechers:  item.leechers  ?? 0,
-    downloads: item.num_files ?? 0,
-    size:      item.total_size ?? 0,
-    hash,
-    accuracy:  "low",
-    date:      new Date((item.timestamp ?? 0) * 1000)
-  };
-}
+function parseHTML(html) {
+  if (!html) return [];
+  const entries = [];
 
-// ─── title helpers ───────────────────────────────────────────────────────────
+  // Match each result row
+  const rowRe = /<tr[^>]+class="category_\d+"[^>]*>([\s\S]*?)<\/tr>/gi;
+  let row;
 
-function pickTitles(media) {
-  const { romaji, english } = media.title;
-  const candidates = [];
+  while ((row = rowRe.exec(html)) !== null) {
+    const cell = row[1];
 
-  const push = t => {
-    if (!t || t.length <= 3) return;
-    const norm = t.trim();
-    if (!candidates.some(c => c.toLowerCase() === norm.toLowerCase()))
-      candidates.push(norm);
-  };
+    // Torrent link + title — first <a> in desc-top td
+    const linkMatch = /href="(https?:\/\/[^"]+\.torrent[^"]*)"[^>]*>([^<]+)</i.exec(cell);
+    if (!linkMatch) continue;
 
-  push(romaji);
-  if (english && english !== romaji) push(english);
+    const link  = linkMatch[1];
+    const title = decodeEntities(linkMatch[2].trim());
 
-  // Season alias (e.g. "2nd Season" → "S2")
-  for (const t of [romaji, english]) {
-    if (!t) continue;
-    const m2 = t.match(/Season (\d)/i);
-    const m1 = t.match(/(\d)(?:nd|rd|th) Season/i);
-    if (m2) push(t.replace(/Season \d/i, `S${m2[1]}`));
-    else if (m1) push(t.replace(/(\d)(?:nd|rd|th) Season/i, `S${m1[1]}`));
+    // Seeders / Leechers from "S:NN L:NN"
+    const slMatch = /S:\s*(\d+)\s+L:\s*(\d+)/i.exec(cell);
+    const seeders  = slMatch ? parseInt(slMatch[1], 10) : 0;
+    const leechers = slMatch ? parseInt(slMatch[2], 10) : 0;
+
+    // Size — "Size: X.XXmb" or "X.XX MB" etc.
+    const sizeMatch = /Size:\s*([\d.]+)\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)/i.exec(cell);
+    const sizeInBytes = sizeMatch
+      ? parseFloat(sizeMatch[1]) * (sizeMap[sizeMatch[2].toUpperCase()] || 1)
+      : 0;
+
+    // Date — "Date: YYYY-MM-DD HH:MM UTC"
+    const dateMatch = /Date:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC)/i.exec(cell);
+    const date = dateMatch ? new Date(dateMatch[1]) : new Date(0);
+
+    // Hash — extract 40-char hex from torrent URL if present
+    const hashMatch = /([0-9a-fA-F]{40})/.exec(link);
+    const idMatch   = /id=(\d+)/i.exec(cell);
+    const hash      = hashMatch?.[1] || idMatch?.[1] || link;
+
+    entries.push({ title, link, seeders, leechers, downloads: 0, size: sizeInBytes, hash, accuracy: "low", date });
   }
 
-  if (candidates.length === 0) {
-    const syn = [...(media.synonyms || [])]
-      .filter(s => s && s.length > 3)
-      .sort((a, b) => a.length - b.length)[0];
-    push(syn);
-  }
-
-  return candidates.slice(0, MAX_TITLES);
+  return entries;
 }
 
-function buildQuery(title, epPart) {
-  // AT search is plain substring — no special operators needed
-  let q = title.replace(/[&?#]/g, " ").replace(/\s+/g, " ").trim();
-  if (epPart) {
-    const firstEp = epPart.match(/"([^"]+)"/)?.[1]?.replace(/[+v-]/g, "").trim();
-    if (firstEp) q += ` ${firstEp}`;
-  }
-  return q;
-}
+// ─── helpers ─────────────────────────────────────────────────────────────────
 
-// ─── shared helpers ──────────────────────────────────────────────────────────
+const sizeMap = {
+  B: 1, KB: 1000, MB: 1e6, GB: 1e9, TB: 1e12,
+  KIB: 1024, MIB: 1024 ** 2, GIB: 1024 ** 3, TIB: 1024 ** 4
+};
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -182,6 +197,42 @@ function zeropad(v = 1, l = 2) {
 const epstring = ep =>
   `"E${zeropad(ep)}+"|"E${zeropad(ep)}v"|"+${zeropad(ep)}+"|"+${zeropad(ep)}v"|"+${zeropad(ep)}-"`;
 
+function buildQuery(title, epPart) {
+  let q = title.replace(/[&?#]/g, " ").replace(/\s+/g, " ").trim();
+  if (epPart) {
+    const firstEp = epPart.match(/"([^"]+)"/)?.[1]?.replace(/[+v-]/g, "").trim();
+    if (firstEp) q += ` ${firstEp}`;
+  }
+  return q;
+}
+
+function pickTitles(media) {
+  const { romaji, english } = media.title;
+  const candidates = [];
+  const push = t => {
+    if (!t || t.length <= 3) return;
+    const norm = t.trim();
+    if (!candidates.some(c => c.toLowerCase() === norm.toLowerCase()))
+      candidates.push(norm);
+  };
+  push(romaji);
+  if (english && english !== romaji) push(english);
+  for (const t of [romaji, english]) {
+    if (!t) continue;
+    const m2 = t.match(/Season (\d)/i);
+    const m1 = t.match(/(\d)(?:nd|rd|th) Season/i);
+    if (m2) push(t.replace(/Season \d/i, `S${m2[1]}`));
+    else if (m1) push(t.replace(/(\d)(?:nd|rd|th) Season/i, `S${m1[1]}`));
+  }
+  if (candidates.length === 0) {
+    const syn = [...(media.synonyms || [])]
+      .filter(s => s && s.length > 3)
+      .sort((a, b) => a.length - b.length)[0];
+    push(syn);
+  }
+  return candidates.slice(0, 3);
+}
+
 function findEdge(media, type, formats = ["TV", "TV_SHORT"], skip) {
   let res = media.relations.edges.find(
     e => e.relationType === type && formats.includes(e.node.format)
@@ -189,4 +240,10 @@ function findEdge(media, type, formats = ["TV", "TV_SHORT"], skip) {
   if (!res && !skip && type === "SEQUEL")
     res = findEdge(media, type, ["TV", "TV_SHORT", "OVA"], true);
   return res;
+}
+
+function decodeEntities(str) {
+  return str
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#34;/g, '"').replace(/&#39;/g, "'");
 }
