@@ -1,8 +1,8 @@
 [
   {
     "manifestVersion": 2,
-    "name": "Nyaa Sukebei",
-    "id": "sukebei-nyaa",
+    "name": "Nyaa",
+    "id": "nyaa",
     "version": "0.0.2",
     "type": "torrent",
     "accuracy": "low",
@@ -13,7 +13,7 @@
     ],
     "icon": "https://sukebei.nyaa.si/static/favicon.png",
     "update": "https://raw.githubusercontent.com/LeinadKenbun/testnyaa/refs/heads/main/index.json",
-    "code": "https://exten.pages.dev/hentai/sukebei.js",
+    "code": "https://raw.githubusercontent.com/LeinadKenbun/testnyaa/refs/heads/main/meow.js",
     "url": "aHR0cHM6Ly9ueWFhLnNpLw=="
   }
 ]
