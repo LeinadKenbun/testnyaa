@@ -12,7 +12,7 @@
       "US"
     ],
     "icon": "https://sukebei.nyaa.si/static/favicon.png",
-    "update": "https://exten.pages.dev/hentai/index.json",
+    "update": "https://raw.githubusercontent.com/LeinadKenbun/testnyaa/refs/heads/main/index.json",
     "code": "https://exten.pages.dev/hentai/sukebei.js",
     "url": "aHR0cHM6Ly9ueWFhLnNpLw=="
   }
