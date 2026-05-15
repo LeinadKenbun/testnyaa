@@ -12,8 +12,8 @@
       "US"
     ],
     "icon": "https://gcp.ttcdn.info/favicon.png",
-    "update": "https://raw.githubusercontent.com/LeinadKenbun/testnyaa/refs/heads/main/index.json",
-    "code": "https://raw.githubusercontent.com/LeinadKenbun/testnyaa/refs/heads/main/densha.js",
+    "update": "https://densha.danielbonquin.workers.dev/index.json",
+    "code": "https://densha.danielbonquin.workers.dev/densha.js",
     "url": "aHR0cHM6Ly9ueWFhLnNpLw=="
   }
 ]
